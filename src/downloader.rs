@@ -45,20 +45,16 @@ use std::{
 use anyhow::anyhow;
 use futures_lite::{future::BoxedLocal, Stream, StreamExt};
 use hashlink::LinkedHashSet;
-use iroh::{
-    endpoint::{self},
-    Endpoint, NodeAddr, NodeId,
-};
-use iroh_metrics::inc;
+use iroh::{endpoint, Endpoint, NodeAddr, NodeId};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_util::{either::Either, sync::CancellationToken, time::delay_queue};
-use tracing::{debug, error, trace, trace_span, warn, Instrument};
+use tracing::{debug, error, error_span, trace, trace_span, warn, Instrument};
 
 use crate::{
-    get::{db::DownloadProgress, Stats},
+    get::{db::DownloadProgress, error::GetError, Stats},
     metrics::Metrics,
     store::Store,
     util::{local_pool::LocalPoolHandle, progress::ProgressSender},
@@ -103,7 +99,7 @@ pub enum FailureAction {
     /// The request was cancelled by us.
     AllIntentsDropped,
     /// An error occurred that prevents the request from being retried at all.
-    AbortRequest(anyhow::Error),
+    AbortRequest(GetError),
     /// An error occurred that suggests the node should not be used in general.
     DropPeer(anyhow::Error),
     /// An error occurred in which neither the node nor the request are at fault.
@@ -146,7 +142,7 @@ pub enum GetOutput<N> {
 }
 
 /// Concurrency limits for the [`Downloader`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConcurrencyLimits {
     /// Maximum number of requests the service performs concurrently.
     pub max_concurrent_requests: usize,
@@ -198,7 +194,7 @@ impl ConcurrencyLimits {
 }
 
 /// Configuration for retry behavior of the [`Downloader`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts for a node that failed to dial or failed with IO errors.
     pub max_retries_per_node: u32,
@@ -330,13 +326,30 @@ impl Future for DownloadHandle {
     }
 }
 
+/// All numerical config options for the downloader.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// Concurrency limits for the downloader.
+    pub concurrency: ConcurrencyLimits,
+    /// Retry configuration for the downloader.
+    pub retry: RetryConfig,
+}
+
 /// Handle for the download services.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct Downloader {
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
     /// Next id to use for a download intent.
-    next_id: Arc<AtomicU64>,
+    next_id: AtomicU64,
     /// Channel to communicate with the service.
     msg_tx: mpsc::Sender<Message>,
+    /// Configuration for the downloader.
+    config: Arc<Config>,
+    metrics: Arc<Metrics>,
 }
 
 impl Downloader {
@@ -345,44 +358,48 @@ impl Downloader {
     where
         S: Store,
     {
-        Self::with_config(store, endpoint, rt, Default::default(), Default::default())
+        Self::with_config(store, endpoint, rt, Default::default())
     }
 
     /// Create a new Downloader with custom [`ConcurrencyLimits`] and [`RetryConfig`].
-    pub fn with_config<S>(
-        store: S,
-        endpoint: Endpoint,
-        rt: LocalPoolHandle,
-        concurrency_limits: ConcurrencyLimits,
-        retry_config: RetryConfig,
-    ) -> Self
+    pub fn with_config<S>(store: S, endpoint: Endpoint, rt: LocalPoolHandle, config: Config) -> Self
     where
         S: Store,
     {
+        let metrics = Arc::new(Metrics::default());
+        let metrics2 = metrics.clone();
         let me = endpoint.node_id().fmt_short();
         let (msg_tx, msg_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
         let dialer = Dialer::new(endpoint);
-
+        let config = Arc::new(config);
+        let config2 = config.clone();
         let create_future = move || {
             let getter = get::IoGetter {
                 store: store.clone(),
             };
-
-            let service = Service::new(getter, dialer, concurrency_limits, retry_config, msg_rx);
-
-            service.run().instrument(trace_span!("downloader", %me))
+            let service = Service::new(getter, dialer, config2, msg_rx, metrics2);
+            service.run().instrument(error_span!("downloader", %me))
         };
         rt.spawn_detached(create_future);
         Self {
-            next_id: Arc::new(AtomicU64::new(0)),
-            msg_tx,
+            inner: Arc::new(Inner {
+                next_id: AtomicU64::new(0),
+                msg_tx,
+                config,
+                metrics,
+            }),
         }
+    }
+
+    /// Get the current configuration.
+    pub fn config(&self) -> &Config {
+        &self.inner.config
     }
 
     /// Queue a download.
     pub async fn queue(&self, request: DownloadRequest) -> DownloadHandle {
         let kind = request.kind;
-        let intent_id = IntentId(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let intent_id = IntentId(self.inner.next_id.fetch_add(1, Ordering::SeqCst));
         let (sender, receiver) = oneshot::channel();
         let handle = DownloadHandle {
             id: intent_id,
@@ -396,7 +413,7 @@ impl Downloader {
         };
         // if this fails polling the handle will fail as well since the sender side of the oneshot
         // will be dropped
-        if let Err(send_err) = self.msg_tx.send(msg).await {
+        if let Err(send_err) = self.inner.msg_tx.send(msg).await {
             let msg = send_err.0;
             debug!(?msg, "download not sent");
         }
@@ -412,7 +429,7 @@ impl Downloader {
             receiver: _,
         } = handle;
         let msg = Message::CancelIntent { id, kind };
-        if let Err(send_err) = self.msg_tx.send(msg).await {
+        if let Err(send_err) = self.inner.msg_tx.send(msg).await {
             let msg = send_err.0;
             debug!(?msg, "cancel not sent");
         }
@@ -424,10 +441,15 @@ impl Downloader {
     /// downloads. Use [`Self::queue`] to queue a download.
     pub async fn nodes_have(&mut self, hash: Hash, nodes: Vec<NodeId>) {
         let msg = Message::NodesHave { hash, nodes };
-        if let Err(send_err) = self.msg_tx.send(msg).await {
+        if let Err(send_err) = self.inner.msg_tx.send(msg).await {
             let msg = send_err.0;
             debug!(?msg, "nodes have not been sent")
         }
+    }
+
+    /// Returns the metrics collected for this downloader.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.inner.metrics
     }
 }
 
@@ -570,21 +592,22 @@ struct Service<G: Getter, D: DialerT> {
     in_progress_downloads: JoinSet<(DownloadKind, InternalDownloadResult)>,
     /// Progress tracker
     progress_tracker: ProgressTracker,
+    metrics: Arc<Metrics>,
 }
 impl<G: Getter<Connection = D::Connection>, D: DialerT> Service<G, D> {
     fn new(
         getter: G,
         dialer: D,
-        concurrency_limits: ConcurrencyLimits,
-        retry_config: RetryConfig,
+        config: Arc<Config>,
         msg_rx: mpsc::Receiver<Message>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Service {
             getter,
             dialer,
             msg_rx,
-            concurrency_limits,
-            retry_config,
+            concurrency_limits: config.concurrency,
+            retry_config: config.retry,
             connected_nodes: Default::default(),
             retry_node_state: Default::default(),
             providers: Default::default(),
@@ -595,6 +618,7 @@ impl<G: Getter<Connection = D::Connection>, D: DialerT> Service<G, D> {
             in_progress_downloads: Default::default(),
             progress_tracker: ProgressTracker::new(),
             queue: Default::default(),
+            metrics,
         }
     }
 
@@ -602,16 +626,16 @@ impl<G: Getter<Connection = D::Connection>, D: DialerT> Service<G, D> {
     async fn run(mut self) {
         loop {
             trace!("wait for tick");
-            inc!(Metrics, downloader_tick_main);
+            self.metrics.downloader_tick_main.inc();
             tokio::select! {
                 Some((node, conn_result)) = self.dialer.next() => {
                     trace!(node=%node.fmt_short(), "tick: connection ready");
-                    inc!(Metrics, downloader_tick_connection_ready);
+                    self.metrics.downloader_tick_connection_ready.inc();
                     self.on_connection_ready(node, conn_result);
                 }
                 maybe_msg = self.msg_rx.recv() => {
                     trace!(msg=?maybe_msg, "tick: message received");
-                    inc!(Metrics, downloader_tick_message_received);
+                    self.metrics.downloader_tick_message_received.inc();
                     match maybe_msg {
                         Some(msg) => self.handle_message(msg).await,
                         None => return self.shutdown().await,
@@ -621,25 +645,26 @@ impl<G: Getter<Connection = D::Connection>, D: DialerT> Service<G, D> {
                     match res {
                         Ok((kind, result)) => {
                             trace!(%kind, "tick: transfer completed");
-                            inc!(Metrics, downloader_tick_transfer_completed);
+                            self::get::track_metrics(&result, &self.metrics);
+                            self.metrics.downloader_tick_transfer_completed.inc();
                             self.on_download_completed(kind, result);
                         }
                         Err(err) => {
                             warn!(?err, "transfer task panicked");
-                            inc!(Metrics, downloader_tick_transfer_failed);
+                            self.metrics.downloader_tick_transfer_failed.inc();
                         }
                     }
                 }
                 Some(expired) = self.retry_nodes_queue.next() => {
                     let node = expired.into_inner();
                     trace!(node=%node.fmt_short(), "tick: retry node");
-                    inc!(Metrics, downloader_tick_retry_node);
+                    self.metrics.downloader_tick_retry_node.inc();
                     self.on_retry_wait_elapsed(node);
                 }
                 Some(expired) = self.goodbye_nodes_queue.next() => {
                     let node = expired.into_inner();
                     trace!(node=%node.fmt_short(), "tick: goodbye node");
-                    inc!(Metrics, downloader_tick_goodbye_node);
+                    self.metrics.downloader_tick_goodbye_node.inc();
                     self.disconnect_idle_node(node, "idle expired");
                 }
             }
