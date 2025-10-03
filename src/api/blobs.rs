@@ -144,14 +144,14 @@ impl Blobs {
     /// clears the protections before.
     ///
     /// Users should rely only on garbage collection for blob deletion.
-    pub(crate) async fn delete_with_opts(&self, options: DeleteOptions) -> RequestResult<()> {
+    pub async fn delete_with_opts(&self, options: DeleteOptions) -> RequestResult<()> {
         trace!("{options:?}");
         self.client.rpc(options).await??;
         Ok(())
     }
 
     /// See [`Self::delete_with_opts`].
-    pub(crate) async fn delete(
+    pub async fn delete(
         &self,
         hashes: impl IntoIterator<Item = impl Into<Hash>>,
     ) -> RequestResult<()> {
