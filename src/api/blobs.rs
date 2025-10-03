@@ -145,7 +145,7 @@ impl Blobs {
     ///
     /// Users should rely only on garbage collection for blob deletion.
     #[cfg(feature = "fs-store")]
-    pub(crate) async fn delete_with_opts(&self, options: DeleteOptions) -> RequestResult<()> {
+    pub async fn delete_with_opts(&self, options: DeleteOptions) -> RequestResult<()> {
         trace!("{options:?}");
         self.client.rpc(options).await??;
         Ok(())
@@ -153,7 +153,7 @@ impl Blobs {
 
     /// See [`Self::delete_with_opts`].
     #[cfg(feature = "fs-store")]
-    pub(crate) async fn delete(
+    pub async fn delete(
         &self,
         hashes: impl IntoIterator<Item = impl Into<Hash>>,
     ) -> RequestResult<()> {
